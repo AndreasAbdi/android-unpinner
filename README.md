@@ -149,6 +149,20 @@ page does not connect, run `adb logcat -s android-unpinner:V '*:S'` and look
 for `Accepted configured proxy key in August pin check`. Other SDKs in the
 app can still report certificate errors for their own endpoints.
 
+Roborock 4.74.04 checks its APK signing certificate when its native codec loads
+during login. The patched APK has to be re-signed, so `push-resources` also
+installs the original public signing certificate for the Roborock-specific
+hook. Launch Roborock with `android-unpinner start-app com.roborock.smart`;
+starting it from the icon skips injection and the app will close at that
+check. Roborock's Google reCAPTCHA uses Cronet, which may fail if mitmproxy
+intercepts its TLS. To tunnel those hosts while capturing Roborock's API,
+start the proxy with:
+
+```powershell
+mitmweb --listen-port 8083 --ignore-hosts 'google|gstatic|recaptcha'
+adb shell settings put global http_proxy 10.0.2.2:8083
+```
+
 ![screenshot](https://uploads.hi.ls/2022-03/2022-03-08_09-09-36.png)
 
 See `android-unpinner --help` for usage details.

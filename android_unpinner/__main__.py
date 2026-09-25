@@ -242,9 +242,11 @@ def copy_files() -> None:
     adb(f"push {gadget_file} /data/local/tmp/{LIBGADGET}")
     adb(f"push {gadget_config_file} /data/local/tmp/{LIBGADGET_CONF}")
 
-    logging.info("Copying builtin Frida scripts to /data/local/tmp/android-unpinner...")
+    logging.info("Copying builtin Frida scripts and resources...")
     adb("shell mkdir -p /data/local/tmp/android-unpinner")
     adb(f"push {quote_arg(here / 'scripts' / 'hide-debugger.js')} /data/local/tmp/android-unpinner/")
+    adb("shell mkdir -p /data/local/tmp/android-unpinner-resources")
+    adb(f"push {quote_arg(here / 'resources' / 'roborock-original-cert.der')} /data/local/tmp/android-unpinner-resources/")
     if ca_pem is not None:
         # The vendored script expects CERT_PEM in its own JS runtime. A separate
         # config.js in the script directory would not share that runtime.

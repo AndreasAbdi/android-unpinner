@@ -523,6 +523,33 @@ Java.perform(function () {
     Java.use('android.util.Log').i('android-unpinner', 'Installing certificate hooks');
     const appPackage = String(Java.use('android.app.ActivityThread').currentPackageName());
     Java.use('android.util.Log').i('android-unpinner', `App package: ${appPackage}`);
+    if (appPackage === 'com.roborock.smart') {
+        // Roborock 4.74.04 checks its original APK signer when librrcodec.so
+        // loads. The APK must be re-signed to inject Frida via JDWP, so expose
+        // its original public signing certificate for this exact signer query.
+        const Log = Java.use('android.util.Log');
+        const File = Java.use('java.io.File');
+        const Files = Java.use('java.nio.file.Files');
+        const Signature = Java.use('android.content.pm.Signature');
+        const MessageDigest = Java.use('java.security.MessageDigest');
+        const originalCert = Files.readAllBytes(File.$new('/data/local/tmp/android-unpinner-resources/roborock-original-cert.der').toPath());
+        const toByteArray = Signature.toByteArray.overload();
+        toByteArray.implementation = function () {
+            const bytes = toByteArray.call(this);
+            const digest = MessageDigest.getInstance('SHA-256').digest(bytes);
+            let hex = '';
+            for (let i = 0; i < digest.length; i++) {
+                const item = (digest[i] & 0xff).toString(16);
+                hex += item.length === 1 ? '0' + item : item;
+            }
+            // SHA-256 of the APK signed by this tool's bundled keystore.
+            if (hex === '2a999b44d41a6546bdbb229a1c780856a34b7c385fab161ac57e77a2e238e9d9') {
+                Log.i('android-unpinner', 'Supplied original Roborock signature bytes');
+                return originalCert;
+            }
+            return bytes;
+        };
+    }
     if (DEBUG_MODE) console.log('\n    === Disabling all recognized unpinning libraries ===');
 
     const classesToPatch = Object.keys(PINNING_FIXES);
