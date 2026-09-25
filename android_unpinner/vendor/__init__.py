@@ -2,7 +2,7 @@ from pathlib import Path
 
 here = Path(__file__).absolute().parent
 
-frida_version = "16.0.10"
+frida_version = "16.7.14"
 gadget_files = {
     "arm": here / f"frida/frida-gadget-{frida_version}-android-arm.so",
     "arm64": here / f"frida/frida-gadget-{frida_version}-android-arm64.so",

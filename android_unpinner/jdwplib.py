@@ -113,7 +113,14 @@ class JDWPClient:
 
         log.info("Starting handshake...")
         self.writer.write(HANDSHAKE)
-        reply = await self.reader.readexactly(len(HANDSHAKE))
+        try:
+            reply = await self.reader.readexactly(len(HANDSHAKE))
+        except asyncio.IncompleteReadError as exc:
+            self.writer.close()
+            raise RuntimeError(
+                "JDWP connection closed during handshake. Another debugger "
+                "(often Android Studio) may already be attached to this app."
+            ) from exc
         if reply != HANDSHAKE:
             raise RuntimeError(f"Handshake failed: {reply=}")
         self._reader_task_instance = asyncio.create_task(self._reader_task())

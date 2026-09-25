@@ -4,7 +4,12 @@ import os
 import zipfile
 import asyncio
 import logging
+import shutil
 import subprocess
+import re
+import json
+import ssl
+import tempfile
 from pathlib import Path
 from time import sleep
 
@@ -25,6 +30,7 @@ LIBGADGET_CONF = "libgadget.config.so"
 
 force = False
 gadget_config_file = gadget_config_file_script_directory
+ca_cert_file: Path | None = None
 
 
 def patch_apk_file(infile: Path, outfile: Path) -> None:
@@ -85,7 +91,11 @@ def install_apk(apk_files: list[Path]) -> None:
     """
     ensure_device_connected()
 
-    package_name = build_tools.package_name(apk_files[0])
+    package_names = {build_tools.package_name(apk) for apk in apk_files}
+    if len(package_names) != 1:
+        raise ValueError("install_apk requires APKs for exactly one package")
+    package_name = next(iter(package_names))
+    apk_files = select_apks_for_device(apk_files)
 
     if package_name in get_packages():
         if not force:
@@ -99,72 +109,100 @@ def install_apk(apk_files: list[Path]) -> None:
 
     logging.info(f"Installing {package_name}...")
     if len(apk_files) > 1:
-        adb(f"install-multiple --no-incremental {' '.join(str(x) for x in apk_files)}")
+        adb(f"install-multiple --no-incremental {' '.join(quote_arg(x) for x in apk_files)}")
     else:
-        adb(f"install --no-incremental {apk_files[0]}")
+        adb(f"install --no-incremental {quote_arg(apk_files[0])}")
 
 
-def find_apks_in_xapk(xapk_path: Path, output_dir = None) -> list[Path] | None:
-    """
-    Extracts APK files from an XAPK file to a folder and returns their paths.
-    """
-
-    if not xapk_path.name.lower().endswith(".xapk"):
-        return None
-
-    if not os.path.exists(xapk_path):
-        return None
-    
-    logging.info(f"Processing XAPK: {os.path.basename(xapk_path)}")
-    
-    if output_dir is None:
-        extraction_dir = xapk_path.parent / f"{xapk_path.stem}_extracted"
-    else:
-        extraction_dir = Path(output_dir).resolve()
-
-    if os.path.exists(extraction_dir):
-        logging.warning(f"Directory '{extraction_dir}' already exists. New files will be merged/overwritten.")
-    else:
-        os.makedirs(extraction_dir)
-        logging.info(f"Created extraction directory: {extraction_dir}")
-
-    apk_files = []
-
-    try:        
-        with zipfile.ZipFile(xapk_path, 'r') as zip_ref:
-            zip_ref.extractall(extraction_dir)
-            logging.info("XAPK extraction complete.")
-
-        logging.info("Searching for APK files...")
-        for root, _, files in os.walk(extraction_dir):
-            for file_name in files:
-                if file_name.lower().endswith(".apk"):
-                    full_path = os.path.join(root, file_name)
-                    apk_files.append(Path(full_path))
-                    logging.info(f"Found APK: {full_path}")
-                    
-        return apk_files
-
-    except zipfile.BadZipFile:
-        logging.error(f"Error: '{xapk_path}' is not a valid ZIP file.")
-        return None
-    except Exception as e:
-        logging.error(f"An unexpected error occurred: {e}")
-        return None
+def quote_arg(value: Path) -> str:
+    """Quote a local path for the shell used by the ADB helper."""
+    if os.name == "nt":
+        return subprocess.list2cmdline([str(value)])
+    import shlex
+    return shlex.quote(str(value))
 
 
-def process_xapks(apk_files: list[Path]) -> list[Path]:
-    """
-    Preprocess the list of APK files to handle any XAPK files.
-    """
-    ret = []
-    for apk in apk_files:
-        if apks := find_apks_in_xapk(apk):
-            ret.extend(apks)
+def select_apks_for_device(apks: list[Path]) -> list[Path]:
+    """Choose one ABI and density configuration split supported by the device."""
+    abi_names = {"arm64_v8a", "armeabi_v7a", "x86", "x86_64"}
+    densities = {"ldpi": 120, "mdpi": 160, "tvdpi": 213, "hdpi": 240,
+                 "xhdpi": 320, "xxhdpi": 480, "xxxhdpi": 640}
+    def split_key(apk: Path) -> str:
+        return apk.stem.removesuffix(".unpinned").removeprefix("split_config.")
+
+    abi_splits = {split_key(apk): apk for apk in apks
+                  if apk.stem.startswith("split_config.") and split_key(apk) in abi_names}
+    density_splits = {split_key(apk): apk for apk in apks
+                      if apk.stem.startswith("split_config.") and split_key(apk) in densities}
+    selected = set(apks)
+    if len(abi_splits) > 1:
+        supported = adb("shell getprop ro.product.cpu.abilist").stdout.strip().split(",")
+        match = next((abi_splits[abi.replace("-", "_")] for abi in supported
+                      if abi.replace("-", "_") in abi_splits), None)
+        if match is None:
+            raise ValueError(f"No compatible ABI split for device: {list(abi_splits)}")
+        selected.difference_update(abi_splits.values())
+        selected.add(match)
+    if len(density_splits) > 1:
+        output = adb("shell wm density").stdout
+        matches = re.findall(r"(?:Override|Physical) density: (\d+)", output)
+        if not matches:
+            raise ValueError(f"Could not determine device density: {output!r}")
+        density = int(matches[-1])
+        match_name = min(density_splits, key=lambda name: abs(densities[name] - density))
+        selected.difference_update(density_splits.values())
+        selected.add(density_splits[match_name])
+    return [apk for apk in apks if apk in selected]
+
+
+def find_apks_in_archive(archive_path: Path) -> list[Path]:
+    """Extract APK members of an XAPK or APKM into a persistent work directory."""
+    extraction_dir = archive_path.parent / f"{archive_path.stem}_extracted"
+    logging.info(f"Processing package archive: {archive_path.name}")
+    with zipfile.ZipFile(archive_path) as archive:
+        members = [info for info in archive.infolist()
+                   if not info.is_dir() and info.filename.lower().endswith(".apk")
+                   and not Path(info.filename).stem.endswith(".unpinned")]
+        if not members:
+            raise ValueError(f"No APK files found in {archive_path}")
+        extraction_dir.mkdir(exist_ok=True)
+        apks = []
+        for member in members:
+            # Archive paths must stay inside the extraction directory.
+            target = (extraction_dir / member.filename).resolve()
+            if not target.is_relative_to(extraction_dir.resolve()):
+                raise ValueError(f"Unsafe APK path in {archive_path}: {member.filename}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(member) as source, target.open("wb") as destination:
+                shutil.copyfileobj(source, destination)
+            apks.append(target)
+    return apks
+
+
+def process_package_inputs(inputs: list[Path]) -> list[Path]:
+    """Expand APKs, extracted directories, XAPKs, and APKM archives."""
+    apks = []
+    for path in inputs:
+        if path.is_dir():
+            found = sorted(p for p in path.rglob("*.apk")
+                           if not p.stem.endswith(".unpinned"))
+            if not found:
+                raise ValueError(f"No APK files found in {path}")
+            apks.extend(found)
+        elif path.suffix.lower() in {".xapk", ".apkm", ".zip"}:
+            apks.extend(find_apks_in_archive(path))
+        elif path.suffix.lower() == ".apk":
+            apks.append(path)
         else:
-            ret.append(apk)
+            raise ValueError(f"Unsupported package input: {path}")
+    return apks
 
-    return ret
+
+def group_apks_by_package(apks: list[Path]) -> dict[str, list[Path]]:
+    packages: dict[str, list[Path]] = {}
+    for apk in apks:
+        packages.setdefault(build_tools.package_name(apk), []).append(apk)
+    return packages
 
 
 def copy_files() -> None:
@@ -172,6 +210,20 @@ def copy_files() -> None:
     Copy the Frida Gadget and unpinning scripts.
     """
     # TODO: We could later provide the option to use a custom script dir.
+    ca_pem = None
+    if gadget_config_file == gadget_config_file_script_directory:
+        certificate = ca_cert_file or Path.home() / ".mitmproxy" / "mitmproxy-ca-cert.pem"
+        if not certificate.is_file():
+            raise RuntimeError(
+                "Proxy CA certificate not found. Pass --ca-cert with the PEM certificate "
+                "used by your proxy."
+            )
+        ca_pem = certificate.read_text(encoding="ascii")
+        try:
+            ssl.PEM_cert_to_DER_cert(ca_pem)
+        except ValueError as exc:
+            raise ValueError(f"Invalid PEM certificate: {certificate}") from exc
+
     ensure_device_connected()
     logging.info("Detect architecture...")
     abi = adb("shell getprop ro.product.cpu.abi").stdout.strip()
@@ -183,7 +235,23 @@ def copy_files() -> None:
     adb(f"push {gadget_config_file} /data/local/tmp/{LIBGADGET_CONF}")
 
     logging.info("Copying builtin Frida scripts to /data/local/tmp/android-unpinner...")
-    adb(f"push {here / 'scripts'}/. /data/local/tmp/android-unpinner/")
+    adb("shell mkdir -p /data/local/tmp/android-unpinner")
+    adb(f"push {quote_arg(here / 'scripts' / 'hide-debugger.js')} /data/local/tmp/android-unpinner/")
+    if ca_pem is not None:
+        # The vendored script expects CERT_PEM in its own JS runtime. A separate
+        # config.js in the script directory would not share that runtime.
+        source = (here / "scripts" / "httptoolkit-unpinner.js").read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as temporary:
+            configured = Path(temporary) / "httptoolkit-unpinner.js"
+            configured.write_text(
+                f"const CERT_PEM = {json.dumps(ca_pem)};\n"
+                "const __au_log = new NativeFunction(Module.getExportByName(null, '__android_log_write'), 'int', ['int', 'pointer', 'pointer']);\n"
+                "__au_log(4, Memory.allocUtf8String('android-unpinner'), Memory.allocUtf8String('Frida script started'));\n"
+                "try {\n" + source +
+                "\n} catch (error) { __au_log(6, Memory.allocUtf8String('android-unpinner'), Memory.allocUtf8String(String(error))); throw error; }\n",
+                encoding="utf-8",
+            )
+            adb(f"push {quote_arg(configured)} /data/local/tmp/android-unpinner/httptoolkit-unpinner.js")
     active_scripts = adb("shell ls /data/local/tmp/android-unpinner").stdout.splitlines(
         keepends=False
     )
@@ -192,6 +260,8 @@ def copy_files() -> None:
 
 def start_app_on_device(package_name: str) -> None:
     ensure_device_connected()
+    logging.info("Stop any existing app process...")
+    adb(f"shell am force-stop {package_name}")
     logging.info("Start app (suspended)...")
     adb(f"shell am set-debug-app -w {package_name}")
     activity = adb(
@@ -310,6 +380,20 @@ listen_option = click.option(
 )
 
 
+def _ca_cert(ctx, param, val):
+    global ca_cert_file
+    ca_cert_file = val
+
+
+ca_cert_option = click.option(
+    "--ca-cert",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    help="PEM proxy CA certificate (defaults to ~/.mitmproxy/mitmproxy-ca-cert.pem).",
+    callback=_ca_cert,
+    expose_value=False,
+)
+
+
 def _device(ctx, param, val):
     if val:
         set_device(val)
@@ -328,6 +412,7 @@ device_option = click.option(
 @verbosity_option
 @force_option
 @listen_option
+@ca_cert_option
 @device_option
 @click.argument(
     "apk-files",
@@ -337,23 +422,20 @@ device_option = click.option(
 )
 def all_cmd(apk_files: list[Path]) -> None:
     """
-    Patch a local APK, then install and start it.
+    Patch, install, and start APKs from one or more packages.
 
-    You may pass multiple files for the same package in case of split APKs.
+    Accepts APK files, extracted directories, XAPK/APKM archives, and APKM ZIPs.
     """
-    apk_files = process_xapks(apk_files)
-    package_names = {build_tools.package_name(apk) for apk in apk_files}
-    if len(package_names) > 1:
-        raise RuntimeError(
-            "Detected multiple APKs with different package names, aborting."
-        )
-    package_name = next(iter(package_names))
-    logging.info(f"Target: {package_name}")
-    apk_patched = patch_apk_files(apk_files)
-    install_apk(apk_patched)
+    packages = group_apks_by_package(process_package_inputs(apk_files))
+    if not packages:
+        raise ValueError("No APK files provided")
+    patched = {name: patch_apk_files(apks) for name, apks in packages.items()}
     copy_files()
-    start_app_on_device(package_name)
-    logging.info("All done! 🎉")
+    for package_name, apks in patched.items():
+        logging.info(f"Target: {package_name}")
+        install_apk(apks)
+        start_app_on_device(package_name)
+    logging.info("All done.")
 
 
 @cli.command("install")
@@ -368,13 +450,11 @@ def all_cmd(apk_files: list[Path]) -> None:
 )
 def install_cmd(apk_files: list[Path]) -> None:
     """
-    Install a package on the device.
-
-    You may pass multiple files for the same package in case of split APKs.
+    Install APKs from one or more packages on the device.
     """
-    apk_files = process_xapks(apk_files)
-    install_apk(apk_files)
-    logging.info("All done! 🎉")
+    for apks in group_apks_by_package(process_package_inputs(apk_files)).values():
+        install_apk(apks)
+    logging.info("All done.")
 
 
 @cli.command()
@@ -388,20 +468,21 @@ def install_cmd(apk_files: list[Path]) -> None:
 )
 def patch_apks(apks: list[Path]) -> None:
     """Patch an APK file to be debuggable."""
-    apks = process_xapks(apks)
+    apks = process_package_inputs(apks)
     patch_apk_files(apks)
-    logging.info("All done! 🎉")
+    logging.info("All done.")
 
 
 @cli.command()
 @verbosity_option
 @force_option
 @listen_option
+@ca_cert_option
 @device_option
 def push_resources() -> None:
     """Copy Frida gadget and scripts to device."""
     copy_files()
-    logging.info("All done! 🎉")
+    logging.info("All done.")
 
 
 @cli.command()
@@ -412,7 +493,7 @@ def push_resources() -> None:
 def start_app(package_name: str) -> None:
     """Start app on device and inject Frida gadget."""
     start_app_on_device(package_name)
-    logging.info("All done! 🎉")
+    logging.info("All done.")
 
 
 @cli.command()
@@ -423,7 +504,7 @@ def list_packages() -> None:
     ensure_device_connected()
     logging.info("Enumerating packages...")
     print("\n".join(get_packages()))
-    logging.info("All done! 🎉")
+    logging.info("All done.")
 
 
 @cli.command()
@@ -463,7 +544,7 @@ def get_apks(package: str, outdir: Path) -> None:
                 outfile.unlink()
         adb(f"pull {apk} {outfile.absolute()}")
 
-    logging.info("All done! 🎉")
+    logging.info("All done.")
 
 
 if __name__ == "__main__":

@@ -276,10 +276,8 @@ const PINNING_FIXES = {
             overload: ['java.lang.String', '[Ljava.security.cert.Certificate;'],
             replacement: () => NO_OP
         },
-        {
-            methodName: 'check$okhttp',
-            replacement: () => NO_OP
-        },
+        // Do not hook check$okhttp here: Ring crashes in the native bridge on
+        // the x86_64 emulator when this Kotlin method is replaced.
     ],
 
     // --- SquareUp OkHttp (< v3)
@@ -433,7 +431,7 @@ const PINNING_FIXES = {
             }
         }
     ],
-    
+
     'com.android.org.conscrypt.TrustManagerImpl': [
         {
             methodName: 'checkTrustedRecursive',
@@ -463,6 +461,8 @@ const getJavaClassIfExists = (clsName) => {
 }
 
 Java.perform(function () {
+    try {
+    Java.use('android.util.Log').i('android-unpinner', 'Installing certificate hooks');
     if (DEBUG_MODE) console.log('\n    === Disabling all recognized unpinning libraries ===');
 
     const classesToPatch = Object.keys(PINNING_FIXES);
@@ -559,4 +559,9 @@ Java.perform(function () {
     });
 
     console.log('== Certificate unpinning completed ==');
+    Java.use('android.util.Log').i('android-unpinner', 'Certificate unpinning hooks loaded');
+    } catch (error) {
+        Java.use('android.util.Log').e('android-unpinner', `Certificate hooks failed: ${error}`);
+        throw error;
+    }
 });
