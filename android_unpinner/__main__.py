@@ -38,20 +38,23 @@ def patch_apk_file(infile: Path, outfile: Path) -> None:
     Patch the APK to be debuggable.
     """
     if outfile.exists():
-        if force or click.confirm(
-            f"Overwrite existing file: {outfile.absolute()}?", abort=True
-        ):
-            outfile.unlink()
+        if not force:
+            click.confirm(
+                f"Overwrite existing file: {outfile.absolute()}?", abort=True
+            )
 
-    logging.info("Make APK debuggable...")
-    frida_tools.apk.make_debuggable(
-        str(infile),
-        str(outfile),
-    )
+    # Publish only a fully signed APK. A failed signing step must not leave
+    # an unsigned .unpinned.apk that a later run could mistake for a result.
+    with tempfile.TemporaryDirectory(dir=outfile.parent) as temporary:
+        # apksigner.bat parses parentheses in filenames as batch syntax on Windows.
+        candidate = Path(temporary) / "patched.apk"
+        logging.info("Make APK debuggable...")
+        frida_tools.apk.make_debuggable(str(infile), str(candidate))
 
-    logging.info("Zipalign & re-sign APK...")
-    build_tools.zipalign(outfile)
-    build_tools.sign(outfile)
+        logging.info("Zipalign & re-sign APK...")
+        build_tools.zipalign(candidate)
+        build_tools.sign(candidate)
+        candidate.replace(outfile)
 
     logging.info(f"Created patched APK: {outfile}")
 
@@ -69,9 +72,14 @@ def patch_apk_files(apks: list[Path]) -> list[Path]:
             continue
 
         outfile = apk.with_suffix(".unpinned" + apk.suffix)
-        if outfile.exists():
+        if outfile.exists() and not force and build_tools.verify_signature(outfile):
             logging.warning(f"Reusing existing file: {outfile}")
         else:
+            if outfile.exists() and not force:
+                logging.warning(
+                    f"Existing patched APK has no valid signature; rebuilding: {outfile}"
+                )
+                outfile.unlink()
             logging.info(f"Patching {apk}...")
             patch_apk_file(apk, outfile)
         patched.append(outfile)
@@ -117,7 +125,7 @@ def install_apk(apk_files: list[Path]) -> None:
 def quote_arg(value: Path) -> str:
     """Quote a local path for the shell used by the ADB helper."""
     if os.name == "nt":
-        return subprocess.list2cmdline([str(value)])
+        return f'"{value}"'
     import shlex
     return shlex.quote(str(value))
 
@@ -267,7 +275,11 @@ def start_app_on_device(package_name: str) -> None:
     activity = adb(
         f'shell cmd "package resolve-activity --brief {package_name} | tail -n 1"'
     ).stdout.strip()
-    adb(f"shell am start -n {activity}")
+    adb(
+        "shell am start -a android.intent.action.MAIN "
+        "-c android.intent.category.LAUNCHER -f 0x10200000 "
+        f"-n {activity}"
+    )
 
     logging.info("Obtain process id...")
     pid = None

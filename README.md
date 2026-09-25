@@ -26,6 +26,8 @@ python -m pip install -e .
 Java must be on `PATH` or available through `JAVA_HOME`. The Android tools used
 for patching and ADB are bundled with this project. Have `adb` on `PATH` for the
 manual device setup commands below.
+If you use Android Studio's bundled Java on Windows, set it in PowerShell with
+`$env:JAVA_HOME = 'C:\Program Files\Android\Android Studio\jbr'` before running the tool.
 
 ## Quick start
 

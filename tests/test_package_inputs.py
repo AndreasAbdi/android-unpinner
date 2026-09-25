@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 import zipfile
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,6 +11,11 @@ from android_unpinner import __main__ as app
 
 
 class PackageInputTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows shell quoting")
+    def test_windows_path_with_parentheses_is_quoted(self):
+        self.assertEqual(app.quote_arg(Path("C:/Downloads/example(arm64).apk")),
+                         '"C:\\Downloads\\example(arm64).apk"')
+
     def test_apkm_zip_extracts_only_apks_and_ignores_old_outputs(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -84,6 +90,35 @@ class PackageInputTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "--ca-cert"):
                     app.copy_files()
             adb.assert_not_called()
+
+    def test_unsigned_patch_is_rebuilt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            apk = Path(temporary) / "sample.apk"
+            apk.touch()
+            unsigned = apk.with_suffix(".unpinned.apk")
+            unsigned.write_bytes(b"unsigned")
+            with patch.object(app, "force", False), \
+                 patch.object(app.build_tools, "verify_signature", return_value=False), \
+                 patch.object(app, "patch_apk_file") as patch_apk:
+                self.assertEqual(app.patch_apk_files([apk]), [unsigned])
+            patch_apk.assert_called_once_with(apk, unsigned)
+            self.assertFalse(unsigned.exists())
+
+    def test_failed_signing_does_not_publish_a_patch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            apk = Path(temporary) / "sample.apk"
+            output = apk.with_suffix(".unpinned.apk")
+
+            def write_candidate(_source, candidate):
+                Path(candidate).write_bytes(b"unsigned")
+
+            with patch.object(app, "force", False), \
+                 patch.object(app.frida_tools.apk, "make_debuggable", side_effect=write_candidate), \
+                 patch.object(app.build_tools, "zipalign"), \
+                 patch.object(app.build_tools, "sign", side_effect=RuntimeError("Java missing")):
+                with self.assertRaisesRegex(RuntimeError, "Java missing"):
+                    app.patch_apk_file(apk, output)
+            self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

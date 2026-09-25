@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 from functools import cache
@@ -19,6 +20,15 @@ else:
     zipalign_binary = here / "linux" / "zipalign"
 
 
+def apksigner_command() -> list[str | Path]:
+    if sys.platform == "win32":
+        # The batch wrapper splits filenames containing parentheses.
+        java_home = os.environ.get("JAVA_HOME")
+        java = Path(java_home) / "bin" / "java.exe" if java_home else "java"
+        return [java, "-jar", here / "win32" / "lib" / "apksigner.jar"]
+    return [apksigner_binary]
+
+
 def zipalign(apk_file: Path) -> None:
     apk_aligned = apk_file.with_suffix(".aligned.apk")
     subprocess.run([
@@ -35,7 +45,7 @@ def sign(apk_file: Path) -> None:
     # android-unpinner.jks was generated as follows:
     # keytool -genkey -v -keystore android-unpinner.jks -alias android-unpinner -keyalg RSA -keysize 2048 -validity 3650
     subprocess.run([
-        apksigner_binary,
+        *apksigner_command(),
         "sign",
         "--v4-signing-enabled",
         "false",
@@ -47,6 +57,14 @@ def sign(apk_file: Path) -> None:
         'android-unpinner',
         apk_file
     ], check=True)
+
+
+def verify_signature(apk_file: Path) -> bool:
+    """Return whether apksigner accepts an existing patched APK."""
+    return subprocess.run(
+        [*apksigner_command(), "verify", apk_file],
+        capture_output=True,
+    ).returncode == 0
 
 
 @cache
