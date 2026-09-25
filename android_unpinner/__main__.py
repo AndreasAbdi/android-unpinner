@@ -302,9 +302,11 @@ def start_app_on_device(package_name: str) -> None:
     async def inject_frida():
         logging.info("Establish Java Debug Wire Protocol Connection over ADB...")
         async with jdwplib.JDWPClient("127.0.0.1", local_port) as client:
-            logging.info("Advance until android.app.Activity.onCreate...")
+            # App code can load native libraries in Application.onCreate, before
+            # the first Activity.onCreate. Install the hooks before that call.
+            logging.info("Advance until android.app.Instrumentation.callApplicationOnCreate...")
             thread_id = await client.advance_to_breakpoint(
-                "Landroid/app/Activity;", "onCreate"
+                "Landroid/app/Instrumentation;", "callApplicationOnCreate"
             )
             logging.info("Copy Frida gadget into app...")
             await client.exec(

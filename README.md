@@ -154,14 +154,24 @@ during login. The patched APK has to be re-signed, so `push-resources` also
 installs the original public signing certificate for the Roborock-specific
 hook. Launch Roborock with `android-unpinner start-app com.roborock.smart`;
 starting it from the icon skips injection and the app will close at that
-check. Roborock's Google reCAPTCHA uses Cronet, which may fail if mitmproxy
+check. The tool injects before `Application.onCreate`, where this version can
+load the codec during startup. If Roborock closes immediately, run
+`adb logcat -s android-unpinner:V Process:I '*:S'` and check for
+`Frida script started` and `Supplied original Roborock signature bytes` for
+the latest app process. Their absence means that process had no hook.
+Roborock's Google reCAPTCHA uses Cronet, which may fail if mitmproxy
 intercepts its TLS. To tunnel those hosts while capturing Roborock's API,
-start the proxy with:
+start the proxy with the following commands. Use the same port for both
+commands; an older proxy still running on a different port will not have the
+Google host exclusions.
 
 ```powershell
 mitmweb --listen-port 8083 --ignore-hosts 'google|gstatic|recaptcha'
 adb shell settings put global http_proxy 10.0.2.2:8083
 ```
+
+If port 8083 is already used by a proxy without those exclusions, use 8084
+in both commands instead.
 
 ![screenshot](https://uploads.hi.ls/2022-03/2022-03-08_09-09-36.png)
 
