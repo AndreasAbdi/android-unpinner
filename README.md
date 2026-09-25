@@ -140,6 +140,15 @@ connected to the device and run `start-app` again. Mapbox's Cronet requests may
 still reject the proxy CA because they use a separate certificate validation
 path.
 
+August 26.18.0 has an additional public-key check when its lock page loads.
+Use the same mitmproxy CA for `push-resources` and the running proxy, then
+launch it with `android-unpinner start-app com.august.luna`. The August hook
+recognizes mitmproxy's leaf certificate when it uses the configured CA key;
+other proxy configurations may need a separate leaf-key match. If the lock
+page does not connect, run `adb logcat -s android-unpinner:V '*:S'` and look
+for `Accepted configured proxy key in August pin check`. Other SDKs in the
+app can still report certificate errors for their own endpoints.
+
 ![screenshot](https://uploads.hi.ls/2022-03/2022-03-08_09-09-36.png)
 
 See `android-unpinner --help` for usage details.

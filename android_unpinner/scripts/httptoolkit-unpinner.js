@@ -65,12 +65,14 @@ function getCustomX509TrustManager() {
 
     const X509TrustManager = Java.use('javax.net.ssl.X509TrustManager');
 
-    const x509TrustManager = trustManagers.find((trustManager) => {
-        return trustManager.class.isAssignableFrom(X509TrustManager.class);
-    });
-
-    // We have to cast it explicitly before Frida will allow us to use the X509 methods:
-    return Java.cast(x509TrustManager, X509TrustManager);
+    // Frida's Java instance wrappers do not reliably expose .class here.
+    // Cast each returned manager until we find one implementing the interface.
+    for (const trustManager of trustManagers) {
+        try {
+            return Java.cast(trustManager, X509TrustManager);
+        } catch (_) {}
+    }
+    throw new Error('No X509TrustManager returned by the proxy CA trust factory');
 }
 
 // Some standard hook replacements for various cases:
@@ -80,6 +82,36 @@ const CHECK_OUR_TRUST_MANAGER_ONLY = () => {
     const trustManager = getCustomX509TrustManager();
     return (certs, authType) => {
         trustManager.checkServerTrusted(certs, authType);
+    };
+};
+const CHECK_AUGUST_PROXY_PUBLIC_KEY = (targetMethod) => {
+    const certBytes = Java.use('java.lang.String').$new(CERT_PEM).getBytes();
+    const proxyCA = buildX509CertificateFromBytes(certBytes);
+    const certs = Java.array('java.security.cert.X509Certificate', [proxyCA]);
+    let expectedKey;
+    try {
+        Java.use('a01$e').$new().checkServerTrusted(certs, 'RSA');
+    } catch (error) {
+        const match = String(error).match(/Expected public key: ([0-9a-f]+), got public key:/);
+        if (match) expectedKey = match[1];
+    }
+    if (!expectedKey) throw new Error('Could not read August public key pin');
+    const publicKey = Java.cast(proxyCA.getPublicKey(), Java.use('java.security.Key'));
+    const keyBytes = publicKey.getEncoded();
+    let proxyKey = '';
+    for (let i = 0; i < keyBytes.length; i++) {
+        const hex = (keyBytes[i] & 0xff).toString(16);
+        proxyKey += hex.length === 1 ? '0' + hex : hex;
+    }
+    proxyKey = proxyKey.replace(/^0+/, '');
+    const Log = Java.use('android.util.Log');
+    return function (radix) {
+        const actual = String(targetMethod.call(this, radix));
+        if (radix === 16 && actual === proxyKey) {
+            Log.i('android-unpinner', 'Accepted configured proxy key in August pin check');
+            return expectedKey;
+        }
+        return actual;
     };
 };
 
@@ -149,6 +181,41 @@ const PINNING_FIXES = {
                     arguments[2] = EMPTY_PINSET;
                     targetMethod.call(this, ...arguments);
                 }
+            }
+        },
+        {
+            methodName: 'findTrustAnchorByIssuerAndSignature',
+            replacement: (targetMethod) => {
+                const certBytes = Java.use('java.lang.String').$new(CERT_PEM).getBytes();
+                const proxyCA = buildX509CertificateFromBytes(certBytes);
+                const proxyAnchor = Java.use('android.security.net.config.TrustAnchor')
+                    .$new(proxyCA, true);
+                const Log = Java.use('android.util.Log');
+                return function (cert) {
+                    const existing = targetMethod.call(this, cert);
+                    if (existing !== null) return existing;
+                    try {
+                        cert.verify(proxyCA.getPublicKey());
+                        Log.i('android-unpinner', 'Accepted proxy CA as Android trust anchor');
+                        return proxyAnchor;
+                    } catch (_) {
+                        return null;
+                    }
+                };
+            }
+        },
+        {
+            methodName: 'findTrustAnchorBySubjectAndPublicKey',
+            replacement: (targetMethod) => {
+                const certBytes = Java.use('java.lang.String').$new(CERT_PEM).getBytes();
+                const proxyCA = buildX509CertificateFromBytes(certBytes);
+                const proxyAnchor = Java.use('android.security.net.config.TrustAnchor')
+                    .$new(proxyCA, true);
+                return function (cert) {
+                    const existing = targetMethod.call(this, cert);
+                    return existing !== null ? existing
+                        : cert.equals(proxyCA) ? proxyAnchor : null;
+                };
             }
         }
     ],
@@ -276,8 +343,7 @@ const PINNING_FIXES = {
             overload: ['java.lang.String', '[Ljava.security.cert.Certificate;'],
             replacement: () => NO_OP
         },
-        // Do not hook check$okhttp here: Ring crashes in the native bridge on
-        // the x86_64 emulator when this Kotlin method is replaced.
+        // Replacing check$okhttp crashes translated ARM apps in the x86_64 emulator.
     ],
 
     // --- SquareUp OkHttp (< v3)
@@ -292,6 +358,17 @@ const PINNING_FIXES = {
             methodName: 'check',
             overload: ['java.lang.String', 'java.util.List'],
             replacement: () => NO_OP
+        }
+    ],
+
+    // August 26.18.0 compares a hard-coded key in a01$e. Replacing that
+    // translated ARM method crashes the x86_64 emulator, so replace only
+    // the hex conversion of the configured proxy CA's public key.
+    'java.math.BigInteger': [
+        {
+            methodName: 'toString',
+            overload: ['int'],
+            replacement: CHECK_AUGUST_PROXY_PUBLIC_KEY
         }
     ],
 
@@ -430,25 +507,6 @@ const PINNING_FIXES = {
                 };
             }
         }
-    ],
-
-    'com.android.org.conscrypt.TrustManagerImpl': [
-        {
-            methodName: 'checkTrustedRecursive',
-            replacement: () => {
-                const arrayList = Java.use("java.util.ArrayList")
-                return function (
-                    certs,
-                    host,
-                    clientAuth,
-                    untrustedChain,
-                    trustAnchorChain,
-                    used
-                )  {
-                    return arrayList.$new();
-                }
-            }
-        }
     ]
 };
 
@@ -463,11 +521,14 @@ const getJavaClassIfExists = (clsName) => {
 Java.perform(function () {
     try {
     Java.use('android.util.Log').i('android-unpinner', 'Installing certificate hooks');
+    const appPackage = String(Java.use('android.app.ActivityThread').currentPackageName());
+    Java.use('android.util.Log').i('android-unpinner', `App package: ${appPackage}`);
     if (DEBUG_MODE) console.log('\n    === Disabling all recognized unpinning libraries ===');
 
     const classesToPatch = Object.keys(PINNING_FIXES);
 
     classesToPatch.forEach((targetClassName) => {
+        if (targetClassName === 'java.math.BigInteger' && appPackage !== 'com.august.luna') return;
         const TargetClass = getJavaClassIfExists(targetClassName);
         if (!TargetClass) {
             // We skip patches for any classes that don't seem to be present. This is common
@@ -549,6 +610,7 @@ Java.perform(function () {
                     // In theory, errors like this should never happen - it means the patch is broken
                     // (e.g. some dynamic patch building fails completely)
                     console.error(`[!] ERROR: ${patchName} failed: ${e}`);
+                    Java.use('android.util.Log').e('android-unpinner', `Hook failed: ${patchName}: ${e.stack || e}`);
                 }
             })
         });
