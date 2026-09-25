@@ -26,8 +26,12 @@ python -m pip install -e .
 Java must be on `PATH` or available through `JAVA_HOME`. The Android tools used
 for patching and ADB are bundled with this project. Have `adb` on `PATH` for the
 manual device setup commands below.
-If you use Android Studio's bundled Java on Windows, set it in PowerShell with
-`$env:JAVA_HOME = 'C:\Program Files\Android\Android Studio\jbr'` before running the tool.
+If you use Android Studio's bundled Java on Windows, set it in the PowerShell
+session before running the tool:
+
+```powershell
+$env:JAVA_HOME = 'C:\Program Files\Android\Android Studio\jbr'
+```
 
 ## Quick start
 
@@ -39,7 +43,36 @@ Enable USB debugging and check that ADB sees the device:
 adb devices
 ```
 
-### 2. Start the proxy
+### 2. Find the package name
+
+`start-app` takes the Android **package name** (application ID), not the app's
+display name or APK filename. For a downloaded `.apk`, ask the tool:
+
+```powershell
+android-unpinner package-name 'C:\path\to\app.apk'
+```
+
+For an app already installed on the device, list its packages:
+
+```powershell
+android-unpinner list-packages
+# In PowerShell, narrow the list if you know part of the name:
+android-unpinner list-packages | Select-String 'ring|roborock|august'
+```
+
+For the APKs tested with this repository:
+
+| App | Package name to pass to `start-app` |
+| --- | --- |
+| Ring | `com.ringapp` |
+| August | `com.august.luna` |
+| Roborock | `com.roborock.smart` |
+
+Check your own APK with `package-name`, since the filename and display name
+are not authoritative. For an APKM or XAPK archive, `all` prints `Target: ...`
+for each package it finds; after installation, `list-packages` shows them too.
+
+### 3. Start the proxy
 
 For an Android emulator, start mitmproxy in one terminal, then point the
 emulator at it from another terminal:
@@ -54,7 +87,7 @@ For a physical device, use your computer's network address instead of
 To return to a direct connection, clear the device proxy with
 `adb shell settings put global http_proxy :0`.
 
-### 3. Patch, install, and start
+### 4. Patch, install, and start
 
 From this repository, the example Ring APKM is saved as a ZIP in the parent
 directory:
@@ -70,22 +103,37 @@ signs the APKs, installs the compatible splits, pushes the unpinning scripts,
 and launches Ring with Frida Gadget. If Ring is already installed, the tool
 asks before uninstalling it; uninstalling removes its app data.
 
-### 4. Launch it again
+For a single downloaded APK, quote the path, especially on Windows where an
+APK filename can contain parentheses:
 
-Every time you want to launch Ring again, start it through the tool:
+```powershell
+android-unpinner all 'C:\path\to\app.apk'
+```
+
+You can pass multiple APKs or archives to `all` in one command. It groups
+them by package, installs each package, and launches each one with the hooks.
+
+### 5. Launch it again
+
+Every time you want to launch a patched app again, choose the matching package
+name. For example:
 
 ```console
 android-unpinner start-app com.ringapp
+android-unpinner start-app com.august.luna
+android-unpinner start-app com.roborock.smart
 ```
 
-Injection applies to the running process. Starting Ring from its icon after
-it exits will start it without the hooks. `start-app` stops any existing Ring
-process and starts a new one with the hooks.
+`start-app` requires the patched app to be installed and the Frida resources
+to have been pushed by `all` or `push-resources`. Injection applies to the
+running process. Starting the app from its icon after it exits starts it
+without the hooks. `start-app` stops any existing process and starts a new one
+with the hooks.
 
 If your proxy CA changes, run `android-unpinner push-resources --ca-cert PATH`
-and then `android-unpinner start-app com.ringapp`. The tool also accepts `.apk`,
-`.apkm`, `.xapk`, APKM `.zip`, and extracted directories. You can pass files
-from multiple packages to `all` or `install`.
+and then `android-unpinner start-app PACKAGE_NAME`. The tool also accepts
+`.apk`, `.apkm`, `.xapk`, APKM `.zip`, and extracted directories. You can pass
+files from multiple packages to `all` or `install`.
 
 If JDWP closes during startup, close Android Studio or another debugger
 connected to the device and run `start-app` again. Mapbox's Cronet requests may
